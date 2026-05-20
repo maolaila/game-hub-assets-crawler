@@ -1,13 +1,31 @@
-import { chromium } from 'playwright';
+import { chromium, devices } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline/promises';
 
-const startUrl = process.argv[2];
+const args = process.argv.slice(2);
+const positionalArgs = args.filter((arg) => !arg.startsWith('--'));
+const [startUrl, rawProjectName] = positionalArgs;
+const shouldPreloadCocosResources = !args.includes('--no-preload-cocos');
 
-if (!startUrl) {
-  console.error('用法：node crawl-assets.mjs "https://你的游戏地址/index.html"');
+function makeSafeFolderName(name) {
+  return String(name || '')
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .slice(0, 80);
+}
+
+const projectName = makeSafeFolderName(rawProjectName);
+
+if (!startUrl || !projectName) {
+  console.error(
+    '用法：node crawl-assets.mjs "https://你的游戏地址/index.html" "项目文件夹名"'
+  );
+  console.error(
+    '示例：node crawl-assets.mjs "https://example.com/game/index.html" mjhl2'
+  );
   process.exit(1);
 }
 
@@ -15,13 +33,15 @@ const timestamp = new Date()
   .toISOString()
   .replace(/[:.]/g, '-');
 
-const saveRoot = path.resolve(`./assets-dump-${timestamp}`);
+const crawledProjectsRoot = path.resolve('./crawled-projects');
+const projectRoot = path.join(crawledProjectsRoot, projectName);
+const saveRoot = path.join(projectRoot, `assets-dump-${timestamp}`);
 const filesDir = path.join(saveRoot, 'files');
 const logFile = path.join(saveRoot, 'assets-log.json');
 
 fs.mkdirSync(filesDir, { recursive: true });
 
-const savedContentHashes = new Set();
+const savedByContentHash = new Map();
 const assetLogs = [];
 
 const staticExts = new Set([
@@ -57,6 +77,373 @@ const ignorePatterns = [
   /ad[_-]?adv/i,
   /sentry/i,
 ];
+
+async function preloadCocosResourcesWhenReady(page) {
+  console.log('[preload] waiting for Cocos resources bundle...');
+
+  const result = await page.evaluate(async () => {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const readyTimeoutMs = 180000;
+    const loadTimeoutMs = 900000;
+    const startedAt = Date.now();
+    let triedLoadBundle = false;
+
+    while (Date.now() - startedAt < readyTimeoutMs) {
+      const cocos = window.cc;
+      let resources =
+        cocos &&
+        (cocos.resources ||
+          (cocos.assetManager &&
+            typeof cocos.assetManager.getBundle === 'function' &&
+            cocos.assetManager.getBundle('resources')));
+
+      if (
+        !resources &&
+        !triedLoadBundle &&
+        cocos?.assetManager &&
+        typeof cocos.assetManager.loadBundle === 'function'
+      ) {
+        triedLoadBundle = true;
+        resources = await new Promise((resolve) => {
+          cocos.assetManager.loadBundle('resources', (err, bundle) => {
+            resolve(err ? null : bundle);
+          });
+        });
+      }
+
+      if (resources && typeof resources.loadDir === 'function') {
+        return await new Promise((resolve) => {
+          let settled = false;
+          let lastLoggedPercent = -1;
+
+          const finish = (payload) => {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            resolve(payload);
+          };
+
+          const timer = setTimeout(() => {
+            finish({
+              ok: false,
+              error: 'Timed out while loading Cocos resources.',
+              count: 0,
+            });
+          }, loadTimeoutMs);
+
+          try {
+            resources.loadDir(
+              '',
+              (finished, total) => {
+                if (!total) {
+                  return;
+                }
+
+                const percent = Math.floor((finished / total) * 100);
+                if (
+                  percent === 100 ||
+                  percent >= lastLoggedPercent + 10
+                ) {
+                  lastLoggedPercent = percent;
+                  console.log(
+                    `[crawler-preload] resources ${finished}/${total} (${percent}%)`
+                  );
+                }
+              },
+              (err, assets) => {
+                clearTimeout(timer);
+                finish({
+                  ok: !err,
+                  error: err ? String(err.message || err) : '',
+                  count: Array.isArray(assets) ? assets.length : 0,
+                });
+              }
+            );
+          } catch (err) {
+            clearTimeout(timer);
+            finish({
+              ok: false,
+              error: String(err.message || err),
+              count: 0,
+            });
+          }
+        });
+      }
+
+      await wait(1000);
+    }
+
+    return {
+      ok: false,
+      error: 'Cocos resources bundle was not ready before timeout.',
+      count: 0,
+    };
+  });
+
+  if (result.ok) {
+    console.log(`[preload] Cocos resources loaded: ${result.count}`);
+  } else {
+    console.warn(`[preload] Cocos resource preload failed: ${result.error}`);
+  }
+}
+
+async function installMouseToTouchBridge(context) {
+  await context.addInitScript(() => {
+    if (window.__crawlerTouchBridgeInstalled) {
+      return;
+    }
+
+    window.__crawlerTouchBridgeInstalled = true;
+
+    const touchState = {
+      active: false,
+      id: 1,
+      loggedStarts: 0,
+      target: null,
+    };
+
+    function getCanvasAtPoint(event) {
+      const elements =
+        typeof document.elementsFromPoint === 'function'
+          ? document.elementsFromPoint(event.clientX, event.clientY)
+          : [document.elementFromPoint(event.clientX, event.clientY)];
+      const canvas = elements.find((item) => item?.tagName === 'CANVAS');
+
+      if (!canvas) {
+        return null;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      if (
+        event.clientX < rect.left ||
+        event.clientX > rect.right ||
+        event.clientY < rect.top ||
+        event.clientY > rect.bottom
+      ) {
+        return null;
+      }
+
+      return canvas;
+    }
+
+    function createTouchList(touches) {
+      const list = touches.slice();
+      list.item = (index) => list[index] || null;
+      return list;
+    }
+
+    function createTouch(event, target, identifier) {
+      const init = {
+        identifier,
+        target,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        pageX: event.pageX,
+        pageY: event.pageY,
+        radiusX: 1,
+        radiusY: 1,
+        rotationAngle: 0,
+        force: event.type === 'mouseup' ? 0 : 0.5,
+      };
+
+      try {
+        return new Touch(init);
+      } catch {
+        return init;
+      }
+    }
+
+    function dispatchTouch(type, event) {
+      const target = touchState.target || getCanvasAtPoint(event);
+      if (!target) {
+        return;
+      }
+
+      if (type === 'touchstart' && touchState.loggedStarts < 5) {
+        touchState.loggedStarts += 1;
+        console.log(
+          `[crawler-touch-bridge] tap ${Math.round(event.clientX)},${Math.round(event.clientY)}`
+        );
+      }
+
+      const touch = createTouch(event, target, touchState.id);
+      const activeTouches =
+        type === 'touchend' || type === 'touchcancel' ? [] : [touch];
+      const touches = createTouchList(activeTouches);
+      const changedTouches = createTouchList([touch]);
+      const targetTouches = createTouchList(activeTouches);
+
+      let touchEvent;
+      try {
+        touchEvent = new TouchEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          touches,
+          changedTouches,
+          targetTouches,
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+        });
+      } catch {
+        touchEvent = document.createEvent('Event');
+        touchEvent.initEvent(type, true, true);
+        Object.defineProperties(touchEvent, {
+          touches: { value: touches },
+          changedTouches: { value: changedTouches },
+          targetTouches: { value: targetTouches },
+        });
+      }
+
+      target.dispatchEvent(touchEvent);
+    }
+
+    function dispatchPointer(type, event) {
+      const target = touchState.target || getCanvasAtPoint(event);
+      if (!target || typeof PointerEvent !== 'function') {
+        return;
+      }
+
+      const isEnd = type === 'pointerup' || type === 'pointercancel';
+      const pointerEvent = new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerId: touchState.id,
+        pointerType: 'touch',
+        isPrimary: true,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        pageX: event.pageX,
+        pageY: event.pageY,
+        width: 1,
+        height: 1,
+        pressure: isEnd ? 0 : 0.5,
+        buttons: isEnd ? 0 : 1,
+        button: 0,
+      });
+
+      target.dispatchEvent(pointerEvent);
+    }
+
+    document.addEventListener(
+      'mousedown',
+      (event) => {
+        if (
+          touchState.active ||
+          event.button !== 0 ||
+          event.isTrusted === false
+        ) {
+          return;
+        }
+
+        const target = getCanvasAtPoint(event);
+        if (!target) {
+          return;
+        }
+
+        touchState.active = true;
+        touchState.id += 1;
+        touchState.target = target;
+        dispatchPointer('pointerdown', event);
+        dispatchTouch('touchstart', event);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'pointerdown',
+      (event) => {
+        if (
+          touchState.active ||
+          event.pointerType !== 'mouse' ||
+          event.button !== 0 ||
+          event.isTrusted === false
+        ) {
+          return;
+        }
+
+        const target = getCanvasAtPoint(event);
+        if (!target) {
+          return;
+        }
+
+        touchState.active = true;
+        touchState.id += 1;
+        touchState.target = target;
+        dispatchPointer('pointerdown', event);
+        dispatchTouch('touchstart', event);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mousemove',
+      (event) => {
+        if (!touchState.active) {
+          return;
+        }
+
+        dispatchPointer('pointermove', event);
+        dispatchTouch('touchmove', event);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'pointermove',
+      (event) => {
+        if (!touchState.active || event.pointerType !== 'mouse') {
+          return;
+        }
+
+        dispatchPointer('pointermove', event);
+        dispatchTouch('touchmove', event);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mouseup',
+      (event) => {
+        if (!touchState.active) {
+          return;
+        }
+
+        dispatchPointer('pointerup', event);
+        dispatchTouch('touchend', event);
+        touchState.active = false;
+        touchState.target = null;
+      },
+      true
+    );
+
+    document.addEventListener(
+      'pointerup',
+      (event) => {
+        if (!touchState.active || event.pointerType !== 'mouse') {
+          return;
+        }
+
+        dispatchPointer('pointerup', event);
+        dispatchTouch('touchend', event);
+        touchState.active = false;
+        touchState.target = null;
+      },
+      true
+    );
+
+    console.log('[crawler-touch-bridge] installed');
+  });
+}
 
 function md5(input) {
   return crypto.createHash('md5').update(input).digest('hex');
@@ -166,15 +553,15 @@ const browser = await chromium.launch({
   headless: false,
 });
 
+const mobileDevice = { ...devices['iPhone 13'] };
+delete mobileDevice.defaultBrowserType;
+
 const context = await browser.newContext({
-  viewport: {
-    width: 430,
-    height: 900,
-  },
-  userAgent:
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+  ...mobileDevice,
   serviceWorkers: 'allow',
 });
+
+await installMouseToTouchBridge(context);
 
 const page = await context.newPage();
 
@@ -203,17 +590,21 @@ page.on('response', async (response) => {
 
     const contentHash = md5(buffer);
 
-    // 同一个资源如果因为 sign 不同重复请求，只保存一份
-    if (savedContentHashes.has(contentHash)) {
-      return;
+    // Keep every URL in the log, but only write duplicate content once.
+    const existingFile = savedByContentHash.get(contentHash);
+
+    const filename =
+      existingFile?.filename || makeSafeFilename(url, contentType, buffer);
+    const filepath = existingFile?.filepath || path.join(filesDir, filename);
+    const duplicateOf = existingFile?.filename || null;
+
+    if (!existingFile) {
+      fs.writeFileSync(filepath, buffer);
+      savedByContentHash.set(contentHash, {
+        filename,
+        filepath,
+      });
     }
-
-    savedContentHashes.add(contentHash);
-
-    const filename = makeSafeFilename(url, contentType, buffer);
-    const filepath = path.join(filesDir, filename);
-
-    fs.writeFileSync(filepath, buffer);
 
     const item = {
       filename,
@@ -223,6 +614,8 @@ page.on('response', async (response) => {
       resourceType,
       contentType,
       size: buffer.length,
+      contentHash,
+      duplicateOf,
       fromServiceWorker:
         typeof response.fromServiceWorker === 'function'
           ? response.fromServiceWorker()
@@ -233,9 +626,11 @@ page.on('response', async (response) => {
     assetLogs.push(item);
     writeLog();
 
-    console.log(
-      `[saved] ${filename} | ${(buffer.length / 1024).toFixed(1)} KB | ${resourceType}`
-    );
+    if (!duplicateOf) {
+      console.log(
+        `[saved] ${filename} | ${(buffer.length / 1024).toFixed(1)} KB | ${resourceType}`
+      );
+    }
   } catch (err) {
     console.warn(`[skip] ${url}`);
     console.warn(`       ${err.message}`);
@@ -244,13 +639,22 @@ page.on('response', async (response) => {
 
 page.on('console', (msg) => {
   const text = msg.text();
-  if (/error|warn/i.test(msg.type())) {
+  if (
+    /error|warn/i.test(msg.type()) ||
+    text.includes('[crawler-preload]') ||
+    text.includes('[crawler-touch-bridge]')
+  ) {
     console.log(`[browser:${msg.type()}] ${text}`);
   }
 });
 
 console.log('开始打开页面：');
 console.log(startUrl);
+console.log('');
+console.log('项目目录：');
+console.log(projectRoot);
+console.log('本次保存目录：');
+console.log(saveRoot);
 console.log('');
 console.log('说明：');
 console.log('1. 浏览器打开后，手动进入游戏、点击按钮、触发不同界面。');
@@ -263,6 +667,14 @@ await page.goto(startUrl, {
   waitUntil: 'domcontentloaded',
   timeout: 120000,
 });
+
+if (shouldPreloadCocosResources) {
+  preloadCocosResourcesWhenReady(page).catch((err) => {
+    console.warn(`[preload] ${err.message}`);
+  });
+} else {
+  console.log('[preload] Cocos resource preload is disabled.');
+}
 
 const rl = readline.createInterface({
   input: process.stdin,

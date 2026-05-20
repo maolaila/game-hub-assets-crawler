@@ -1,0 +1,1 @@
+{"Login":{"LoginFail":"登录失败，系统正在重试...（%{times}次）","WebLoginReload":"刷新","WebLoginDismiss":"关闭","WebLoginLoading":"正在加载","WebLoginLoadPageFailed":"加载失败","WebLoginLogin":"登入"}}

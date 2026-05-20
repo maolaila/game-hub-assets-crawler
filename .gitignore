@@ -1,4 +1,8 @@
 node_modules/
 assets-dump-*/
+crawled-projects/*
+!crawled-projects/.gitkeep
+!crawled-projects/jtty/
+!crawled-projects/jtty/**
 .env
 .env.*
